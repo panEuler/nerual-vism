@@ -10,22 +10,12 @@ def eikonal_loss(
     query_points: torch.Tensor,
     mask: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Autograd-based eikonal penalty on masked query groups.
-
-    Shapes:
-    - pred_sdf: [Q]
-    - query_points: [Q, 3]
-    - mask: [Q] or None
-    - grads: [Q, 3]
-
-    The implementation keeps the gradient computation over the full query tensor and only
-    masks the per-sample penalties afterward, which avoids breaking the autograd graph.
-    """
+    """Autograd-based eikonal penalty on masked batched query groups."""
     if mask is not None and not torch.any(mask):
         return pred_sdf.new_zeros(())
 
     grads = _safe_query_grads(pred_sdf, query_points)
-    penalty = (grads.norm(dim=-1) - 1.0).pow(2)  # [Q]
+    penalty = (grads.norm(dim=-1) - 1.0).pow(2)
     if mask is not None:
-        penalty = penalty[mask]  # [Qm]
+        penalty = penalty[mask]
     return penalty.mean()

@@ -17,9 +17,9 @@ from biomol_surface_unsup.datasets.sampling import sample_query_points
 
 
 class MoleculeDataset(Dataset):
-    """Toy dataset that returns a single fake molecule sample.
+    """Toy dataset that returns deterministic padded-batch friendly samples.
 
-    Shapes:
+    Per-sample shapes before collation:
     - coords: [N, 3]
     - atom_types: [N]
     - radii: [N]
@@ -49,24 +49,29 @@ class MoleculeDataset(Dataset):
         return len(self.items)
 
     def __getitem__(self, idx: int) -> dict[str, Any]:
+        if torch is None:
+            raise RuntimeError("MoleculeDataset requires torch in the current toy training path")
+
+        atom_drop = idx % min(max(self.num_atoms - 1, 1), 3)
+        query_drop = idx % min(max(self.num_query_points - 2, 1), 3)
+        effective_num_atoms = max(1, self.num_atoms - atom_drop)
+        effective_num_queries = max(3, self.num_query_points - query_drop)
+
         coords_data = [
             [0.0, 0.0, 0.0],
             [1.5, 0.0, 0.0],
             [0.0, 1.5, 0.0],
             [0.0, 0.0, 1.5],
-        ][: self.num_atoms]
-        atom_types_data = [0, 1, 2, 3][: self.num_atoms]
-        radii_data = [1.2, 1.5, 1.4, 1.3][: self.num_atoms]
-
-        if torch is None:
-            raise RuntimeError("MoleculeDataset requires torch in the current toy training path")
+        ][:effective_num_atoms]
+        atom_types_data = [0, 1, 2, 3][:effective_num_atoms]
+        radii_data = [1.2, 1.5, 1.4, 1.3][:effective_num_atoms]
 
         coords = torch.tensor(coords_data, dtype=torch.float32)  # [N, 3]
         atom_types = torch.tensor(atom_types_data, dtype=torch.long)  # [N]
         radii = torch.tensor(radii_data, dtype=torch.float32)  # [N]
         sampling = sample_query_points(
             coords=coords,
-            num_query_points=self.num_query_points,
+            num_query_points=effective_num_queries,
             padding=self.bbox_padding,
             radii=radii,
         )

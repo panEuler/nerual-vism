@@ -24,26 +24,48 @@ def test_build_loss_and_call() -> None:
 
 
 def test_containment_loss_uses_margin_penalty() -> None:
-    pred_sdf = torch.tensor([-0.8, -0.6, 0.1], dtype=torch.float32)
-    value = containment_loss(pred_sdf, margin=0.5)
+    pred_sdf = torch.tensor([[-0.8, -0.6, 0.1]], dtype=torch.float32)
+    mask = torch.tensor([[True, True, True]])
+    value = containment_loss(pred_sdf, margin=0.5, mask=mask)
     expected = torch.tensor([0.0, 0.0, 0.36], dtype=torch.float32).mean()
     assert torch.allclose(value, expected)
 
 
-def _build_batch(query_group: torch.Tensor) -> tuple[dict[str, torch.Tensor], torch.Tensor]:
+def _build_batch() -> tuple[dict[str, torch.Tensor], torch.Tensor]:
     query_points = torch.tensor(
-        [[0.0, 0.0, 0.0], [1.0, 0.5, 0.0], [0.0, 1.0, 0.5], [0.2, 0.1, 0.0]],
+        [
+            [[0.0, 0.0, 0.0], [1.0, 0.5, 0.0], [0.0, 1.0, 0.5], [0.2, 0.1, 0.0]],
+            [[0.5, 0.0, 0.0], [0.2, 0.3, 0.0], [0.0, 0.0, 0.0], [0.0, 0.0, 0.0]],
+        ],
         dtype=torch.float32,
         requires_grad=True,
     )
     pred_sdf = query_points.pow(2).sum(dim=-1) - 0.2
     batch = {
-        "coords": torch.tensor([[0.0, 0.0, 0.0], [1.5, 0.0, 0.0]], dtype=torch.float32),
-        "atom_types": torch.tensor([1, 6], dtype=torch.long),
-        "radii": torch.tensor([1.2, 1.3], dtype=torch.float32),
+        "coords": torch.tensor(
+            [
+                [[0.0, 0.0, 0.0], [1.5, 0.0, 0.0], [0.2, 1.1, 0.0]],
+                [[0.0, 0.0, 0.0], [1.0, 0.2, 0.0], [0.0, 0.0, 0.0]],
+            ],
+            dtype=torch.float32,
+        ),
+        "atom_types": torch.tensor([[1, 6, 8], [1, 6, 0]], dtype=torch.long),
+        "radii": torch.tensor([[1.2, 1.3, 1.1], [1.1, 1.0, 0.0]], dtype=torch.float32),
+        "atom_mask": torch.tensor([[True, True, True], [True, True, False]]),
         "query_points": query_points,
-        "query_group": query_group,
-        "containment_points": query_points[query_group == QUERY_GROUP_CONTAINMENT],
+        "query_group": torch.tensor(
+            [
+                [QUERY_GROUP_GLOBAL, QUERY_GROUP_CONTAINMENT, QUERY_GROUP_SURFACE_BAND, QUERY_GROUP_CONTAINMENT],
+                [QUERY_GROUP_GLOBAL, QUERY_GROUP_SURFACE_BAND, QUERY_GROUP_GLOBAL, QUERY_GROUP_GLOBAL],
+            ],
+            dtype=torch.long,
+        ),
+        "query_mask": torch.tensor(
+            [[True, True, True, True], [True, True, False, False]],
+            dtype=torch.bool,
+        ),
+        "containment_points": torch.zeros((2, 2, 3), dtype=torch.float32),
+        "containment_mask": torch.tensor([[True, True], [False, False]], dtype=torch.bool),
     }
     return batch, pred_sdf
 
@@ -67,12 +89,7 @@ def test_normalize_loss_config_preserves_default_behavior() -> None:
 
 
 def test_build_loss_fn_returns_weighted_losses_from_default_mapping() -> None:
-    batch, pred_sdf = _build_batch(
-        torch.tensor(
-            [QUERY_GROUP_GLOBAL, QUERY_GROUP_CONTAINMENT, QUERY_GROUP_SURFACE_BAND, QUERY_GROUP_CONTAINMENT],
-            dtype=torch.long,
-        )
-    )
+    batch, pred_sdf = _build_batch()
     loss_fn = build_loss_fn(
         {
             "loss": {
@@ -91,24 +108,19 @@ def test_build_loss_fn_returns_weighted_losses_from_default_mapping() -> None:
     losses = loss_fn(batch, {"sdf": pred_sdf})
     assert {"area", "volume", "containment", "weak_prior", "eikonal", "total"}.issubset(losses)
     assert losses["containment_count"].item() == 2.0
-    assert losses["global_count"].item() == 1.0
-    assert losses["surface_band_count"].item() == 1.0
-    assert losses["weak_prior_count"].item() == 1.0
-    assert losses["area_count"].item() == 1.0
-    assert losses["volume_count"].item() == 1.0
-    assert losses["eikonal_count"].item() == 2.0
+    assert losses["global_count"].item() == 2.0
+    assert losses["surface_band_count"].item() == 2.0
+    assert losses["weak_prior_count"].item() == 2.0
+    assert losses["area_count"].item() == 2.0
+    assert losses["volume_count"].item() == 2.0
+    assert losses["eikonal_count"].item() == 4.0
     assert losses["containment"].ndim == 0
     assert losses["total"].ndim == 0
     assert float(losses["total"].detach().cpu()) >= 0.0
 
 
 def test_build_loss_fn_supports_multi_group_union_masks() -> None:
-    batch, pred_sdf = _build_batch(
-        torch.tensor(
-            [QUERY_GROUP_GLOBAL, QUERY_GROUP_CONTAINMENT, QUERY_GROUP_SURFACE_BAND, QUERY_GROUP_CONTAINMENT],
-            dtype=torch.long,
-        )
-    )
+    batch, pred_sdf = _build_batch()
     loss_fn = build_loss_fn(
         {
             "loss": {
@@ -124,19 +136,21 @@ def test_build_loss_fn_supports_multi_group_union_masks() -> None:
     )
 
     losses = loss_fn(batch, {"sdf": pred_sdf})
-    assert losses["containment_count"].item() == pytest.approx(3.0)
-    assert losses["surface_band_count"].item() == pytest.approx(1.0)
-    assert losses["eikonal_count"].item() == pytest.approx(2.0)
+    assert losses["containment_count"].item() == pytest.approx(4.0)
+    assert losses["surface_band_count"].item() == pytest.approx(2.0)
+    assert losses["eikonal_count"].item() == pytest.approx(4.0)
     assert losses["containment"].item() >= 0.0
     assert losses["total"].ndim == 0
 
 
 def test_build_loss_fn_handles_empty_masks_from_configured_groups() -> None:
-    batch, pred_sdf = _build_batch(
-        torch.tensor(
+    batch, pred_sdf = _build_batch()
+    batch["query_group"] = torch.tensor(
+        [
             [QUERY_GROUP_GLOBAL, QUERY_GROUP_CONTAINMENT, QUERY_GROUP_CONTAINMENT, QUERY_GROUP_GLOBAL],
-            dtype=torch.long,
-        )
+            [QUERY_GROUP_GLOBAL, QUERY_GROUP_GLOBAL, QUERY_GROUP_GLOBAL, QUERY_GROUP_GLOBAL],
+        ],
+        dtype=torch.long,
     )
     loss_fn = build_loss_fn(
         {
@@ -161,27 +175,24 @@ def test_build_loss_fn_handles_empty_masks_from_configured_groups() -> None:
     assert losses["containment_count"].item() == pytest.approx(0.0)
     assert losses["eikonal"].item() == pytest.approx(0.0)
     assert losses["eikonal_count"].item() == pytest.approx(0.0)
-    assert losses["volume_count"].item() == pytest.approx(2.0)
+    assert losses["volume_count"].item() == pytest.approx(4.0)
 
 
-def test_train_step_runs_backward_and_optimizer_step_on_toy_batch() -> None:
+def test_train_step_runs_backward_and_optimizer_step_on_batched_toy_batch() -> None:
     class TinyModel(torch.nn.Module):
         def __init__(self) -> None:
             super().__init__()
             self.scale = torch.nn.Parameter(torch.tensor(0.25, dtype=torch.float32))
             self.bias = torch.nn.Parameter(torch.tensor(0.0, dtype=torch.float32))
 
-        def forward(self, coords, atom_types, radii, query_points):
-            del coords, atom_types, radii
+        def forward(self, coords, atom_types, radii, query_points, atom_mask=None, query_mask=None):
+            del coords, atom_types, radii, atom_mask
             sdf = self.scale * query_points.pow(2).sum(dim=-1) + self.bias
+            if query_mask is not None:
+                sdf = sdf * query_mask.to(sdf.dtype)
             return {"sdf": sdf}
 
-    batch, _ = _build_batch(
-        torch.tensor(
-            [QUERY_GROUP_GLOBAL, QUERY_GROUP_CONTAINMENT, QUERY_GROUP_SURFACE_BAND, QUERY_GROUP_GLOBAL],
-            dtype=torch.long,
-        )
-    )
+    batch, _ = _build_batch()
     loss_fn = build_loss_fn({"loss": {}})
     model = TinyModel()
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-2)
@@ -192,4 +203,6 @@ def test_train_step_runs_backward_and_optimizer_step_on_toy_batch() -> None:
 
     assert "total" in metrics
     assert metrics["total"] >= 0.0
+    assert metrics["volume_count"] == pytest.approx(2.0)
+    assert metrics["containment_count"] == pytest.approx(2.0)
     assert not torch.allclose(before, after)

@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 from .atom_features import AtomFeatureEmbedding
 
+
 class GlobalFeatureEncoder(nn.Module):
     def __init__(self, num_atom_types: int, atom_embed_dim: int, hidden_dim: int, out_dim: int):
         super().__init__()
@@ -14,9 +15,23 @@ class GlobalFeatureEncoder(nn.Module):
         )
         self.out = nn.Linear(hidden_dim, out_dim)
 
-    def forward(self, coords, atom_types, radii):
+    def forward(self, coords, atom_types, radii, atom_mask=None):
+        squeeze_batch = coords.ndim == 2
+        if squeeze_batch:
+            coords = coords.unsqueeze(0)
+            atom_types = atom_types.unsqueeze(0)
+            radii = radii.unsqueeze(0)
+            atom_mask = None if atom_mask is None else atom_mask.unsqueeze(0)
+
+        if atom_mask is None:
+            atom_mask = torch.ones(atom_types.shape, dtype=torch.bool, device=atom_types.device)
+
         atom_emb = self.atom_embedding(atom_types)
-        x = torch.cat([coords, atom_emb, radii.unsqueeze(-1)], dim=-1)
-        h = self.mlp(x)
-        pooled = h.mean(dim=0)
-        return self.out(pooled)
+        x = torch.cat([coords, atom_emb, radii.unsqueeze(-1)], dim=-1)  # [B, N, F]
+        h = self.mlp(x) * atom_mask.unsqueeze(-1).to(x.dtype)
+        denom = atom_mask.sum(dim=1, keepdim=True).clamp_min(1).to(h.dtype)
+        pooled = h.sum(dim=1) / denom
+        out = self.out(pooled)
+        if squeeze_batch:
+            return out.squeeze(0)
+        return out

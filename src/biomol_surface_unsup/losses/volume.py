@@ -14,20 +14,11 @@ def volume_loss(
     target_volume_fraction: float = 0.5,
     eps: float = 0.1,
 ) -> torch.Tensor:
-    """Toy volume-fraction penalty on masked SDF samples.
-
-    Shapes:
-    - pred_sdf: [Q]
-    - mask: [Q] or None
-
-    Notes:
-    - This is a stable sampling-based placeholder for the toy path; it is not a
-      physically accurate volume integral.
-    """
+    """Toy volume-fraction penalty on masked batched SDF samples."""
     if mask is not None:
         if not torch.any(mask):
             return pred_sdf.new_zeros(())
-        pred_sdf = pred_sdf[mask]  # [Qm]
+        pred_sdf = pred_sdf[mask]
 
     inside = smooth_heaviside(-pred_sdf, eps).mean()
     target = pred_sdf.new_tensor(float(target_volume_fraction))

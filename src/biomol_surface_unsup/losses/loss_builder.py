@@ -7,7 +7,6 @@ from biomol_surface_unsup.datasets.sampling import (
     QUERY_GROUP_GLOBAL,
     QUERY_GROUP_SURFACE_BAND,
 )
-from biomol_surface_unsup.geometry.sdf_ops import atomic_union_field
 from biomol_surface_unsup.losses.area import area_loss
 from biomol_surface_unsup.losses.containment import containment_loss
 from biomol_surface_unsup.losses.eikonal import eikonal_loss
@@ -25,51 +24,23 @@ QUERY_GROUP_IDS = {
 SUPPORTED_LOSSES = ("containment", "weak_prior", "area", "volume", "eikonal")
 
 
-def _masked_count(mask: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
-    """Return scalar sample count for a boolean mask.
+def _batched_atomic_union_field(coords: torch.Tensor, radii: torch.Tensor, query_points: torch.Tensor) -> torch.Tensor:
+    pairwise = torch.cdist(query_points, coords) - radii.unsqueeze(-2)
+    return -torch.logsumexp(-10.0 * pairwise, dim=-1) / 10.0
 
-    Shape:
-    - mask: [Q]
-    """
+
+def _masked_count(mask: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
     return mask.sum().to(dtype)
 
 
-def _group_mask(query_group: torch.Tensor, group_names: list[str]) -> torch.Tensor:
-    """Build the union mask for one loss from configured query-group names.
-
-    Shapes:
-    - query_group: [Q]
-    - return: [Q]
-
-    Notes:
-    - Empty `group_names` is allowed and returns an all-false mask so the loss is
-      stable for ablations that disable a scope.
-    - Multiple group names are combined with boolean OR to form a set union.
-    """
+def _group_mask(query_group: torch.Tensor, query_mask: torch.Tensor, group_names: list[str]) -> torch.Tensor:
     mask = torch.zeros_like(query_group, dtype=torch.bool)
     for group_name in group_names:
         if group_name not in QUERY_GROUP_IDS:
             supported = ", ".join(sorted(QUERY_GROUP_IDS))
             raise ValueError(f"unsupported query group '{group_name}', expected one of: {supported}")
         mask = mask | (query_group == QUERY_GROUP_IDS[group_name])
-    return mask
-
-
-def _containment_from_model(
-    pred_sdf: torch.Tensor,
-    containment_mask: torch.Tensor,
-    margin: float,
-) -> torch.Tensor:
-    """Containment term evaluated on the configured containment mask.
-
-    Shapes:
-    - pred_sdf: [Q]
-    - containment_mask: [Q]
-    - pred_sdf[containment_mask]: [Qc]
-    """
-    if not torch.any(containment_mask):
-        return pred_sdf.new_zeros(())
-    return containment_loss(pred_sdf[containment_mask], margin=margin)
+    return mask & query_mask
 
 
 def build_loss_fn(cfg: dict[str, object]):
@@ -81,26 +52,33 @@ def build_loss_fn(cfg: dict[str, object]):
     containment_margin = float(loss_cfg.get("containment_margin", 0.5))
 
     def loss_fn(batch: dict[str, torch.Tensor], model_out: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
-        coords = batch["coords"]  # [N, 3]
-        radii = batch["radii"]  # [N]
-        query_points = batch["query_points"]  # [Q, 3]
-        query_group = batch["query_group"]  # [Q]
-        pred_sdf = model_out["sdf"]  # [Q]
+        coords = batch["coords"]  # [B, N, 3]
+        radii = batch["radii"]  # [B, N]
+        atom_mask = batch["atom_mask"]  # [B, N]
+        query_points = batch["query_points"]  # [B, Q, 3]
+        query_group = batch["query_group"]  # [B, Q]
+        query_mask = batch["query_mask"]  # [B, Q]
+        pred_sdf = model_out["sdf"]  # [B, Q]
 
-        if pred_sdf.ndim != 1:
-            pred_sdf = pred_sdf.reshape(-1)
+        if pred_sdf.ndim == 1:
+            pred_sdf = pred_sdf.unsqueeze(0)
+        if query_points.ndim == 2:
+            query_points = query_points.unsqueeze(0)
+            query_group = query_group.unsqueeze(0)
+            query_mask = query_mask.unsqueeze(0)
+            coords = coords.unsqueeze(0)
+            radii = radii.unsqueeze(0)
+            atom_mask = atom_mask.unsqueeze(0)
         if not query_points.requires_grad:
             query_points = query_points.requires_grad_(True)
 
-        # Base query-group counts are logged independently of the objective so debug
-        # output still shows how many samples came from each sampler bucket.
         base_masks = {
-            "global": _group_mask(query_group, ["global"]),
-            "containment": _group_mask(query_group, ["containment"]),
-            "surface_band": _group_mask(query_group, ["surface_band"]),
+            "global": _group_mask(query_group, query_mask, ["global"]),
+            "containment": _group_mask(query_group, query_mask, ["containment"]),
+            "surface_band": _group_mask(query_group, query_mask, ["surface_band"]),
         }
         loss_masks = {
-            loss_name: _group_mask(query_group, configured_losses[loss_name]["groups"])
+            loss_name: _group_mask(query_group, query_mask, configured_losses[loss_name]["groups"])
             for loss_name in SUPPORTED_LOSSES
         }
 
@@ -118,15 +96,19 @@ def build_loss_fn(cfg: dict[str, object]):
                 query_points,
                 pred_sdf,
                 mask=loss_masks["weak_prior"],
+                atom_mask=atom_mask,
             ),
             "eikonal": eikonal_loss(pred_sdf, query_points, mask=loss_masks["eikonal"]),
-            "containment": _containment_from_model(
+            "containment": containment_loss(
                 pred_sdf,
-                loss_masks["containment"],
                 margin=containment_margin,
+                mask=loss_masks["containment"],
             ),
         }
-        losses["target_sdf"] = atomic_union_field(coords, radii, query_points).detach().mean()
+        safe_coords = coords.masked_fill(~atom_mask.unsqueeze(-1), 0.0)
+        safe_radii = radii.masked_fill(~atom_mask, 0.0)
+        target_sdf = _batched_atomic_union_field(safe_coords, safe_radii, query_points).detach()
+        losses["target_sdf"] = target_sdf[query_mask].mean() if torch.any(query_mask) else pred_sdf.new_zeros(())
         losses["global_count"] = _masked_count(base_masks["global"], pred_sdf.dtype)
         losses["containment_count"] = _masked_count(base_masks["containment"], pred_sdf.dtype)
         losses["surface_band_count"] = _masked_count(base_masks["surface_band"], pred_sdf.dtype)
