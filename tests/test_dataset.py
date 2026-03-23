@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import unittest
 
+from biomol_surface_unsup.datasets.collate import collate_fn
 from biomol_surface_unsup.datasets.molecule_dataset import MoleculeDataset
 
 
@@ -29,6 +30,15 @@ class DatasetTestCase(unittest.TestCase):
             self.assertEqual(len(radii), 4)
             self.assertEqual(len(query_points), 6)
             self.assertEqual(len(query_points[0]), 3)
+
+    def test_collate_preserves_single_sample_shapes(self) -> None:
+        sample = MoleculeDataset(num_query_points=5)[0]
+        batch = collate_fn([sample])
+
+        self.assertEqual(tuple(batch["coords"].shape), (4, 3))
+        self.assertEqual(tuple(batch["atom_types"].shape), (4,))
+        self.assertEqual(tuple(batch["radii"].shape), (4,))
+        self.assertEqual(tuple(batch["query_points"].shape), (5, 3))
 
 
 if __name__ == "__main__":
