@@ -14,41 +14,50 @@ try:
 except Exception as exc:  # pragma: no cover - script path
     raise SystemExit(f"smoke_test requires torch: {exc}")
 
+from biomol_surface_unsup.datasets.collate import collate_fn
 from biomol_surface_unsup.datasets.molecule_dataset import MoleculeDataset
 from biomol_surface_unsup.losses.loss_builder import build_loss_fn
 from biomol_surface_unsup.models.surface_model import SurfaceModel
 
 
 def main() -> int:
-    dataset = MoleculeDataset(num_query_points=16)
-    sample = dataset[0]
+    dataset = MoleculeDataset(num_samples=2, num_atoms=4, num_query_points=16)
+    batch = collate_fn([dataset[0], dataset[1]])
 
-    # coords: [N, 3], atom_types: [N], radii: [N], query_points: [Q, 3]
-    assert sample["coords"].shape == (4, 3)
-    assert sample["atom_types"].shape == (4,)
-    assert sample["radii"].shape == (4,)
-    assert sample["query_points"].shape == (16, 3)
+    assert batch["coords"].shape[0] == 2
+    assert batch["coords"].shape[-1] == 3
+    assert batch["atom_mask"].shape[:2] == batch["coords"].shape[:2]
+    assert batch["query_points"].shape[0] == 2
+    assert batch["query_points"].shape[-1] == 3
+    assert batch["query_mask"].shape[:2] == batch["query_points"].shape[:2]
 
     model = SurfaceModel(num_atom_types=16)
-    query_points = sample["query_points"].requires_grad_(True)
+    query_points = batch["query_points"].requires_grad_(True)
     output = model(
-        sample["coords"],
-        sample["atom_types"],
-        sample["radii"],
+        batch["coords"],
+        batch["atom_types"],
+        batch["radii"],
         query_points,
+        atom_mask=batch["atom_mask"],
+        query_mask=batch["query_mask"],
     )
     assert "sdf" in output
-    assert output["sdf"].shape == (16,)
-    assert output["features"].shape[0] == 16
-    assert output["mask"].shape[0] == 16
+    assert output["sdf"].shape == batch["query_group"].shape
+    assert output["features"].shape[:2] == batch["query_points"].shape[:2]
+    assert output["mask"].shape[:2] == batch["query_points"].shape[:2]
 
     loss_fn = build_loss_fn({"loss": {}})
     losses = loss_fn(
         {
-            "coords": sample["coords"],
-            "atom_types": sample["atom_types"],
-            "radii": sample["radii"],
+            "coords": batch["coords"],
+            "atom_types": batch["atom_types"],
+            "radii": batch["radii"],
+            "atom_mask": batch["atom_mask"],
             "query_points": query_points,
+            "query_group": batch["query_group"],
+            "query_mask": batch["query_mask"],
+            "containment_points": batch["containment_points"],
+            "containment_mask": batch["containment_mask"],
         },
         output,
     )

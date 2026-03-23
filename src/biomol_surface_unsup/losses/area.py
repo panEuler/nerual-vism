@@ -9,16 +9,12 @@ def smooth_delta(phi: torch.Tensor, eps: float) -> torch.Tensor:
 
 
 def _safe_query_grads(pred_sdf: torch.Tensor, query_points: torch.Tensor) -> torch.Tensor:
-    """Return d(pred_sdf.sum()) / d(query_points) with a stable fallback.
+    """Return d(pred_sdf.sum()) / d(query_points) with batched support.
 
     Shapes:
-    - pred_sdf: [Q]
-    - query_points: [Q, 3]
-    - return: [Q, 3]
-
-    Notes:
-    - In the toy path we prefer a numerically stable placeholder over failing the
-      whole step if `pred_sdf` is temporarily disconnected from `query_points`.
+    - pred_sdf: [Q] or [B, Q]
+    - query_points: [Q, 3] or [B, Q, 3]
+    - return: same leading shape as query_points
     """
     grads = torch.autograd.grad(
         outputs=pred_sdf,
@@ -30,8 +26,6 @@ def _safe_query_grads(pred_sdf: torch.Tensor, query_points: torch.Tensor) -> tor
         allow_unused=True,
     )[0]
     if grads is None:
-        # Minimal stable approximation: zero gradient means this term contributes no
-        # shape signal until the model/query path is connected again.
         grads = torch.zeros_like(query_points)
     return grads
 
@@ -42,22 +36,18 @@ def area_loss(
     mask: torch.Tensor | None = None,
     eps: float = 0.1,
 ) -> torch.Tensor:
-    """Toy surface-area surrogate on masked queries.
+    """Toy surface-area surrogate on masked batched queries.
 
     Shapes:
-    - pred_sdf: [Q]
-    - query_points: [Q, 3]
-    - mask: [Q] or None
-    - grads: [Q, 3]
-
-    We compute gradients on all queries first, then reduce only over the selected mask so
-    autograd still has a valid graph into the original query_points tensor.
+    - pred_sdf: [Q] or [B, Q]
+    - query_points: [Q, 3] or [B, Q, 3]
+    - mask: [Q] or [B, Q] or None
     """
     if mask is not None and not torch.any(mask):
         return pred_sdf.new_zeros(())
 
     grads = _safe_query_grads(pred_sdf, query_points)
-    integrand = smooth_delta(pred_sdf, eps) * grads.norm(dim=-1)  # [Q]
+    integrand = smooth_delta(pred_sdf, eps) * grads.norm(dim=-1)
     if mask is not None:
-        integrand = integrand[mask]  # [Qm]
+        integrand = integrand[mask]
     return integrand.mean()

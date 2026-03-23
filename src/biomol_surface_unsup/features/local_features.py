@@ -7,17 +7,22 @@ from biomol_surface_unsup.features.atom_features import AtomFeatureEmbedding
 
 
 class LocalFeatureBuilder(nn.Module):
-    """Build toy local neighbor features for each query point.
+    """Build local neighbor features with explicit batch/query/atom masks.
 
-    Shapes:
-    - coords: [N, 3]
-    - atom_types: [N]
-    - radii: [N]
-    - query_points: [Q, 3]
-    - features: [Q, K, F]
-    - mask: [Q, K]
-    - neighbor_indices: [Q, K]
-    - neighbor_distances: [Q, K]
+    Batched shapes:
+    - coords: [B, N, 3]
+    - atom_types: [B, N]
+    - radii: [B, N]
+    - atom_mask: [B, N]
+    - query_points: [B, Q, 3]
+    - query_mask: [B, Q]
+    - features: [B, Q, K, F]
+    - neighbor_mask: [B, Q, K]
+    - neighbor_indices: [B, Q, K]
+    - neighbor_distances: [B, Q, K]
+
+    Single-sample compatibility:
+    - 2D/1D inputs are promoted to batch size 1 internally.
     """
 
     def __init__(
@@ -35,7 +40,6 @@ class LocalFeatureBuilder(nn.Module):
         self.rbf_centers = nn.Parameter(torch.linspace(0.0, self.cutoff, rbf_dim), requires_grad=False)
         gamma = 1.0 / max(self.cutoff / max(rbf_dim, 1), 1e-6) ** 2
         self.rbf_gamma = float(gamma)
-        # feature = relative xyz [3] + radius [1] + atom embedding [E] + distance RBF [R] + distance scalar [1]
         self.feature_dim = 3 + 1 + atom_embed_dim + rbf_dim + 1
 
     def forward(
@@ -44,43 +48,83 @@ class LocalFeatureBuilder(nn.Module):
         atom_types: torch.Tensor,
         radii: torch.Tensor,
         query_points: torch.Tensor,
+        atom_mask: torch.Tensor | None = None,
+        query_mask: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
-        num_queries = query_points.shape[0]
-        num_atoms = coords.shape[0]
-        k = min(self.max_neighbors, num_atoms)
+        squeeze_batch = coords.ndim == 2
+        if squeeze_batch:
+            coords = coords.unsqueeze(0)
+            atom_types = atom_types.unsqueeze(0)
+            radii = radii.unsqueeze(0)
+            query_points = query_points.unsqueeze(0)
+            atom_mask = None if atom_mask is None else atom_mask.unsqueeze(0)
+            query_mask = None if query_mask is None else query_mask.unsqueeze(0)
 
-        # dists: [Q, N]
-        dists = torch.cdist(query_points, coords)
-        sorted_dists, sorted_indices = torch.topk(dists, k=k, dim=-1, largest=False)
+        batch_size, num_atoms, _ = coords.shape
+        _, num_queries, _ = query_points.shape
+        if atom_mask is None:
+            atom_mask = torch.ones((batch_size, num_atoms), dtype=torch.bool, device=coords.device)
+        if query_mask is None:
+            query_mask = torch.ones((batch_size, num_queries), dtype=torch.bool, device=query_points.device)
 
-        # mask: [Q, K]
-        mask = (sorted_dists <= self.cutoff).to(query_points.dtype)
-        if num_atoms > 0:
-            # Keep at least one neighbor per query in the toy path so the encoder sees a valid token.
-            mask[:, 0] = 1.0
+        k = min(self.max_neighbors, num_atoms) if num_atoms > 0 else 0
+        if k == 0:
+            feature_shape = (batch_size, num_queries, 0, self.feature_dim)
+            empty_features = query_points.new_zeros(feature_shape)
+            empty_mask = torch.zeros((batch_size, num_queries, 0), dtype=torch.bool, device=query_points.device)
+            empty_index = torch.zeros((batch_size, num_queries, 0), dtype=torch.long, device=query_points.device)
+            empty_dist = query_points.new_zeros((batch_size, num_queries, 0))
+            result = {
+                "features": empty_features,
+                "mask": empty_mask,
+                "neighbor_indices": empty_index,
+                "neighbor_distances": empty_dist,
+            }
+            if squeeze_batch:
+                return {k_: v.squeeze(0) for k_, v in result.items()}
+            return result
 
-        flat_indices = sorted_indices.reshape(-1)
-        neighbor_coords = coords.index_select(0, flat_indices).reshape(num_queries, k, 3)  # [Q, K, 3]
-        neighbor_radii = radii.index_select(0, flat_indices).reshape(num_queries, k, 1)  # [Q, K, 1]
-        neighbor_atom_types = atom_types.index_select(0, flat_indices).reshape(num_queries, k)  # [Q, K]
-        neighbor_atom_emb = self.atom_embedding(neighbor_atom_types)  # [Q, K, E]
+        dists = torch.cdist(query_points, coords)  # [B, Q, N]
+        masked_dists = dists.masked_fill(~atom_mask.unsqueeze(1), float("inf"))
+        sorted_dists, sorted_indices = torch.topk(masked_dists, k=k, dim=-1, largest=False)
 
-        # rel_pos: [Q, K, 3], rel_dist: [Q, K, 1]
-        rel_pos = query_points.unsqueeze(1) - neighbor_coords
+        neighbor_atom_mask = torch.gather(
+            atom_mask.unsqueeze(1).expand(-1, num_queries, -1),
+            2,
+            sorted_indices,
+        )
+        neighbor_mask = neighbor_atom_mask & (sorted_dists <= self.cutoff) & query_mask.unsqueeze(-1)
+
+        gather_index_xyz = sorted_indices.unsqueeze(-1).expand(-1, -1, -1, 3)
+        gather_coords = coords.unsqueeze(1).expand(-1, num_queries, -1, -1)
+        neighbor_coords = torch.gather(gather_coords, 2, gather_index_xyz)
+
+        gather_radii = radii.unsqueeze(1).expand(-1, num_queries, -1)
+        neighbor_radii = torch.gather(gather_radii, 2, sorted_indices).unsqueeze(-1)
+
+        gather_atom_types = atom_types.unsqueeze(1).expand(-1, num_queries, -1)
+        neighbor_atom_types = torch.gather(gather_atom_types, 2, sorted_indices)
+        neighbor_atom_emb = self.atom_embedding(neighbor_atom_types)
+
+        rel_pos = query_points.unsqueeze(2) - neighbor_coords
         rel_dist = sorted_dists.unsqueeze(-1)
+        centers = self.rbf_centers.to(query_points.device, query_points.dtype).view(1, 1, 1, -1)
+        rbf = torch.exp(-self.rbf_gamma * (rel_dist - centers).pow(2))
 
-        centers = self.rbf_centers.to(query_points.device, query_points.dtype).view(1, 1, -1)
-        rbf = torch.exp(-self.rbf_gamma * (rel_dist - centers).pow(2))  # [Q, K, R]
+        features = torch.cat([rel_pos, neighbor_radii, neighbor_atom_emb, rbf, rel_dist], dim=-1)
+        features = features.masked_fill(~neighbor_mask.unsqueeze(-1), 0.0)
+        safe_indices = sorted_indices.masked_fill(~neighbor_atom_mask, -1)
+        safe_dists = sorted_dists.masked_fill(~neighbor_mask, 0.0)
 
-        features = torch.cat([rel_pos, neighbor_radii, neighbor_atom_emb, rbf, rel_dist], dim=-1)  # [Q, K, F]
-        features = features * mask.unsqueeze(-1)
-
-        return {
+        result = {
             "features": features,
-            "mask": mask,
-            "neighbor_indices": sorted_indices,
-            "neighbor_distances": sorted_dists,
+            "mask": neighbor_mask,
+            "neighbor_indices": safe_indices,
+            "neighbor_distances": safe_dists,
         }
+        if squeeze_batch:
+            return {k_: v.squeeze(0) for k_, v in result.items()}
+        return result
 
 
 def build_local_features(sample: dict[str, object]) -> dict[str, object]:
