@@ -1,0 +1,63 @@
+from __future__ import annotations
+
+try:
+    import torch
+    from torch.utils.data import DataLoader
+except Exception:  # pragma: no cover - environment fallback
+    torch = None
+    DataLoader = None
+
+from biomol_surface_unsup.datasets.collate import collate_fn
+from biomol_surface_unsup.datasets.molecule_dataset import MoleculeDataset
+from biomol_surface_unsup.losses.loss_builder import build_loss_fn
+from biomol_surface_unsup.models.surface_model import SurfaceModel
+from biomol_surface_unsup.training.optimizer import build_optimizer
+from biomol_surface_unsup.training.train_step import train_step
+
+
+class Trainer:
+    def __init__(self, cfg):
+        if torch is None or DataLoader is None:
+            raise RuntimeError("torch is required to run Trainer in this environment")
+
+        self.cfg = cfg
+        requested_device = str(cfg["train"].get("device", "cpu"))
+        if requested_device == "cuda" and not torch.cuda.is_available():
+            requested_device = "cpu"
+        self.device = requested_device
+
+        data_cfg = cfg["data"]
+        train_cfg = cfg["train"]
+        self.train_dataset = MoleculeDataset(
+            root=data_cfg.get("root", "data/processed/toy"),
+            split=data_cfg.get("train_split", "train"),
+            num_samples=1,
+            num_atoms=4,
+            num_query_points=int(data_cfg.get("num_query_points", 32)),
+            bbox_padding=float(data_cfg.get("bbox_padding", 2.0)),
+        )
+        self.train_loader = DataLoader(
+            self.train_dataset,
+            batch_size=int(train_cfg.get("batch_size", 1)),
+            shuffle=False,
+            num_workers=int(train_cfg.get("num_workers", 0)),
+            collate_fn=collate_fn,
+        )
+
+        self.model = SurfaceModel(num_atom_types=16).to(self.device)
+        self.loss_fn = build_loss_fn(cfg)
+        self.optimizer = build_optimizer(
+            self.model,
+            lr=float(train_cfg.get("lr", 1e-3)),
+            weight_decay=float(train_cfg.get("weight_decay", 1e-5)),
+        )
+
+    def train(self):
+        num_epochs = int(self.cfg["train"].get("epochs", 1))
+        for epoch in range(num_epochs):
+            for step, batch in enumerate(self.train_loader):
+                metrics = train_step(self.model, batch, self.loss_fn, self.optimizer, self.device)
+                print(f"epoch={epoch} step={step} metrics={metrics}")
+
+    def evaluate(self):
+        print("TODO")

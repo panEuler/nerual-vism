@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.venv/
+venv/
+dist/
+build/
+outputs/logs/*
+outputs/checkpoints/*
+outputs/metrics/*
+outputs/meshes/*
+!outputs/logs/.gitkeep
+!outputs/checkpoints/.gitkeep
+!outputs/metrics/.gitkeep
+!outputs/meshes/.gitkeep

@@ -1,0 +1,5 @@
+name: local_unsup
+model: local_deepsets
+loss: vism_lite
+data: toy
+train: base

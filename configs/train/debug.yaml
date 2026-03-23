@@ -1,0 +1,9 @@
+batch_size: 1
+num_workers: 0
+epochs: 2
+lr: 1.0e-3
+weight_decay: 1.0e-5
+device: cuda
+seed: 42
+log_every: 10
+save_every: 1

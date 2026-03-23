@@ -1,0 +1,9 @@
+lambda_area: 1.0
+lambda_volume: 0.5
+lambda_containment: 2.0
+lambda_prior: 0.5
+lambda_eikonal: 0.1
+
+heaviside_eps: 0.1
+delta_eps: 0.1
+containment_margin: 0.5
