@@ -13,6 +13,7 @@ from biomol_surface_unsup.losses.loss_builder import build_loss_fn
 from biomol_surface_unsup.models.surface_model import SurfaceModel
 from biomol_surface_unsup.training.optimizer import build_optimizer
 from biomol_surface_unsup.training.train_step import train_step
+from biomol_surface_unsup.utils.config import normalize_loss_config
 
 
 class Trainer:
@@ -45,7 +46,11 @@ class Trainer:
         )
 
         self.model = SurfaceModel(num_atom_types=16).to(self.device)
-        self.loss_fn = build_loss_fn(cfg)
+        # Trainer only passes through the normalized objective config. Loss scope and
+        # weighting logic stay centralized in loss_builder for easier ablations.
+        loss_runtime_cfg = dict(cfg)
+        loss_runtime_cfg["loss"] = normalize_loss_config(cfg.get("loss", {}))
+        self.loss_fn = build_loss_fn(loss_runtime_cfg)
         self.optimizer = build_optimizer(
             self.model,
             lr=float(train_cfg.get("lr", 1e-3)),

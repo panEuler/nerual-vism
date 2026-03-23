@@ -5,8 +5,14 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
+from biomol_surface_unsup.datasets.sampling import (
+    QUERY_GROUP_CONTAINMENT,
+    QUERY_GROUP_GLOBAL,
+    QUERY_GROUP_SURFACE_BAND,
+)
 from biomol_surface_unsup.losses.containment import containment_loss
 from biomol_surface_unsup.losses.loss_builder import build_loss, build_loss_fn
+from biomol_surface_unsup.utils.config import normalize_loss_config
 
 
 def test_build_loss_and_call() -> None:
@@ -23,7 +29,7 @@ def test_containment_loss_uses_margin_penalty() -> None:
     assert torch.allclose(value, expected)
 
 
-def test_build_loss_fn_returns_weighted_losses() -> None:
+def _build_batch(query_group: torch.Tensor) -> tuple[dict[str, torch.Tensor], torch.Tensor]:
     query_points = torch.tensor(
         [[0.0, 0.0, 0.0], [1.0, 0.5, 0.0], [0.0, 1.0, 0.5], [0.2, 0.1, 0.0]],
         dtype=torch.float32,
@@ -34,17 +40,47 @@ def test_build_loss_fn_returns_weighted_losses() -> None:
         "coords": torch.tensor([[0.0, 0.0, 0.0], [1.5, 0.0, 0.0]], dtype=torch.float32),
         "radii": torch.tensor([1.2, 1.3], dtype=torch.float32),
         "query_points": query_points,
-        "query_group": torch.tensor([0, 1, 2, 1], dtype=torch.long),
-        "containment_points": query_points[torch.tensor([1, 3])],
+        "query_group": query_group,
+        "containment_points": query_points[query_group == QUERY_GROUP_CONTAINMENT],
     }
+    return batch, pred_sdf
+
+
+def test_normalize_loss_config_preserves_default_behavior() -> None:
+    normalized = normalize_loss_config(
+        {
+            "lambda_area": 1.0,
+            "lambda_volume": 0.5,
+            "lambda_containment": 2.0,
+            "lambda_prior": 0.5,
+            "lambda_eikonal": 0.1,
+        }
+    )
+
+    assert normalized["losses"]["containment"] == {"weight": 2.0, "groups": ["containment"]}
+    assert normalized["losses"]["weak_prior"] == {"weight": 0.5, "groups": ["surface_band"]}
+    assert normalized["losses"]["area"] == {"weight": 1.0, "groups": ["surface_band"]}
+    assert normalized["losses"]["volume"] == {"weight": 0.5, "groups": ["global"]}
+    assert normalized["losses"]["eikonal"] == {"weight": 0.1, "groups": ["global", "surface_band"]}
+
+
+def test_build_loss_fn_returns_weighted_losses_from_default_mapping() -> None:
+    batch, pred_sdf = _build_batch(
+        torch.tensor(
+            [QUERY_GROUP_GLOBAL, QUERY_GROUP_CONTAINMENT, QUERY_GROUP_SURFACE_BAND, QUERY_GROUP_CONTAINMENT],
+            dtype=torch.long,
+        )
+    )
     loss_fn = build_loss_fn(
         {
             "loss": {
-                "lambda_area": 1.0,
-                "lambda_volume": 0.5,
-                "lambda_containment": 2.0,
-                "lambda_prior": 0.5,
-                "lambda_eikonal": 0.1,
+                "losses": {
+                    "containment": {"weight": 2.0, "groups": ["containment"]},
+                    "weak_prior": {"weight": 0.5, "groups": ["surface_band"]},
+                    "area": {"weight": 1.0, "groups": ["surface_band"]},
+                    "volume": {"weight": 0.5, "groups": ["global"]},
+                    "eikonal": {"weight": 0.1, "groups": ["global", "surface_band"]},
+                },
                 "containment_margin": 0.5,
             }
         }
@@ -64,22 +100,63 @@ def test_build_loss_fn_returns_weighted_losses() -> None:
     assert float(losses["total"].detach().cpu()) >= 0.0
 
 
-def test_build_loss_fn_handles_empty_surface_band_masks() -> None:
-    query_points = torch.tensor([[0.0, 0.0, 0.0], [0.2, 0.0, 0.0]], dtype=torch.float32, requires_grad=True)
-    pred_sdf = query_points[:, 0] - 0.1
-    batch = {
-        "coords": torch.tensor([[0.0, 0.0, 0.0]], dtype=torch.float32),
-        "radii": torch.tensor([1.0], dtype=torch.float32),
-        "query_points": query_points,
-        "query_group": torch.tensor([0, 1], dtype=torch.long),
-        "containment_points": query_points[torch.tensor([1])],
-    }
-    loss_fn = build_loss_fn({"loss": {}})
+def test_build_loss_fn_supports_multi_group_union_masks() -> None:
+    batch, pred_sdf = _build_batch(
+        torch.tensor(
+            [QUERY_GROUP_GLOBAL, QUERY_GROUP_CONTAINMENT, QUERY_GROUP_SURFACE_BAND, QUERY_GROUP_CONTAINMENT],
+            dtype=torch.long,
+        )
+    )
+    loss_fn = build_loss_fn(
+        {
+            "loss": {
+                "losses": {
+                    "containment": {"weight": 1.0, "groups": ["containment", "surface_band"]},
+                    "weak_prior": {"weight": 1.0, "groups": ["surface_band"]},
+                    "area": {"weight": 1.0, "groups": ["surface_band"]},
+                    "volume": {"weight": 1.0, "groups": ["global"]},
+                    "eikonal": {"weight": 1.0, "groups": ["global", "surface_band"]},
+                }
+            }
+        }
+    )
+
+    losses = loss_fn(batch, {"sdf": pred_sdf})
+    assert losses["containment_count"].item() == pytest.approx(3.0)
+    assert losses["surface_band_count"].item() == pytest.approx(1.0)
+    assert losses["eikonal_count"].item() == pytest.approx(2.0)
+    assert losses["containment"].item() >= 0.0
+    assert losses["total"].ndim == 0
+
+
+def test_build_loss_fn_handles_empty_masks_from_configured_groups() -> None:
+    batch, pred_sdf = _build_batch(
+        torch.tensor(
+            [QUERY_GROUP_GLOBAL, QUERY_GROUP_CONTAINMENT, QUERY_GROUP_CONTAINMENT, QUERY_GROUP_GLOBAL],
+            dtype=torch.long,
+        )
+    )
+    loss_fn = build_loss_fn(
+        {
+            "loss": {
+                "losses": {
+                    "containment": {"weight": 1.0, "groups": []},
+                    "weak_prior": {"weight": 1.0, "groups": ["surface_band"]},
+                    "area": {"weight": 1.0, "groups": ["surface_band"]},
+                    "volume": {"weight": 1.0, "groups": ["global"]},
+                    "eikonal": {"weight": 1.0, "groups": []},
+                }
+            }
+        }
+    )
 
     losses = loss_fn(batch, {"sdf": pred_sdf})
     assert losses["area"].item() == pytest.approx(0.0)
     assert losses["weak_prior"].item() == pytest.approx(0.0)
     assert losses["area_count"].item() == pytest.approx(0.0)
     assert losses["weak_prior_count"].item() == pytest.approx(0.0)
-    assert losses["volume_count"].item() == pytest.approx(1.0)
-    assert losses["eikonal_count"].item() == pytest.approx(1.0)
+    assert losses["containment"].item() == pytest.approx(0.0)
+    assert losses["containment_count"].item() == pytest.approx(0.0)
+    assert losses["eikonal"].item() == pytest.approx(0.0)
+    assert losses["eikonal_count"].item() == pytest.approx(0.0)
+    assert losses["volume_count"].item() == pytest.approx(2.0)
