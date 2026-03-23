@@ -15,6 +15,10 @@ except Exception as exc:  # pragma: no cover - script path
     raise SystemExit(f"smoke_test requires torch: {exc}")
 
 from biomol_surface_unsup.datasets.molecule_dataset import MoleculeDataset
+from biomol_surface_unsup.training.trainer import _ensure_local_feature_builder
+
+_ensure_local_feature_builder()
+
 from biomol_surface_unsup.models.surface_model import SurfaceModel
 
 

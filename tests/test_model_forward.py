@@ -6,6 +6,10 @@ import pytest
 torch = pytest.importorskip("torch")
 
 from biomol_surface_unsup.datasets.molecule_dataset import MoleculeDataset
+from biomol_surface_unsup.training.trainer import _ensure_local_feature_builder
+
+_ensure_local_feature_builder()
+
 from biomol_surface_unsup.models.surface_model import SurfaceModel
 
 
@@ -22,3 +26,5 @@ def test_model_forward():
         sample["query_points"],
     )
     assert out["sdf"].shape == (32,)
+    assert out["z_local"].shape == (32, 128)
+    assert out["z_global"].shape == (32, 128)
